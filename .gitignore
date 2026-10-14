@@ -1,0 +1,44 @@
+# Python/build outputs: never include developer environment in runtime mirror.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# Local secrets and editor state.
+.env
+.env.*
+!.env.example
+*.pem
+*.pfx
+*.key
+.idea/
+.vscode/
+
+# Runtime profiles, caches, logs and installer state.
+.cache/
+logs/
+*.log
+runtime/
+downloads/
+profiles/
+state.json
+data/local/*
+!data/local/zaaps.json
+data/client_profiles.json
+data/client_index.json
+data/client_index.ini
+data/quest_progress.json
+data/network_character_bindings.json
+data/craft_selection.json
+data/bootstrap_status.txt
+
+# Local operating system artefacts.
+.DS_Store
+Thumbs.db
+desktop.ini
