@@ -13,13 +13,14 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .install import (
-    active_executable, install_release, mark_healthy, read_state, rollback_pending,
+    active_executable, install_release, mark_healthy, read_state, rollback_pending, slot_path,
 )
 from .release_client import UpdateError, download_archive, latest_release
 from .disk_space import ensure_space
 from .user_data import prepare_user_data
 from .self_update import schedule_launcher_upgrade
 from .install_location import runtime_root, set_runtime_root
+from .manifest import verify_file
 
 APP_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "DofusAtlas"
 ROOT = runtime_root()
@@ -62,7 +63,13 @@ def _run_lock():
 
 def _launch_with_health(executable: Path, report, *, settle_seconds: float = 0) -> bool:
     USER_DIR.mkdir(parents=True, exist_ok=True)
-    prepare_user_data(executable, USER_DIR, legacy_root=Path(sys.executable).resolve().parent)
+    install_state = read_state(ROOT)
+    previous = install_state.get("previous") if install_state.get("pending") else None
+    previous_root = (slot_path(ROOT, previous) / "AtlasApp" / "_internal"
+                     if previous else None)
+    prepare_user_data(executable, USER_DIR,
+                      legacy_root=Path(sys.executable).resolve().parent,
+                      previous_install_root=previous_root)
     health_dir = ROOT / ".health"
     health_dir.mkdir(parents=True, exist_ok=True)
     ready = health_dir / (uuid.uuid4().hex + ".ready")
@@ -112,6 +119,13 @@ def run_update(report) -> None:
                 current_exe = active_executable(ROOT)
             except UpdateError:
                 current_exe = None
+            if current_exe is not None and prior.get("source_sha") == remote.manifest.source_sha:
+                report("Verification de l'installation...", 7)
+                installed = slot_path(ROOT, prior["active"])
+                if any(not verify_file(installed / entry.path, entry)
+                       for entry in remote.manifest.files):
+                    current_exe = None
+                    report("Installation endommagee — reparation...", 9)
             if prior.get("blocked_source_sha") == remote.manifest.source_sha:
                 report("Mise a jour en attente de correction", 10)
             elif prior.get("source_sha") != remote.manifest.source_sha or current_exe is None:
