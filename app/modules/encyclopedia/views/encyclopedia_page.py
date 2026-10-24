@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import logging
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Thread
+from threading import Thread, current_thread
 from typing import TYPE_CHECKING, Callable
 
 from PySide6.QtCore import QTimer, Qt, Signal
@@ -137,6 +137,21 @@ class _AchievementStagePayload:
     progress_synchronized: bool = False
 
 
+def _join_runtime_threads(threads: list[Thread]) -> None:
+    active = current_thread()
+    for thread in tuple(threads):
+        if thread is not active and thread.is_alive():
+            thread.join()
+
+
+def _start_runtime_thread(owner: object, target, name: str) -> None:
+    thread = Thread(target=target, name=name, daemon=True)
+    threads = getattr(owner, "_runtime_threads", None)
+    if isinstance(threads, list):
+        threads.append(thread)
+    thread.start()
+
+
 class EncyclopediaPage(QWidget):
     guideRuntimeFinished = Signal(object)
     achievementRuntimeFinished = Signal(object)
@@ -158,7 +173,7 @@ class EncyclopediaPage(QWidget):
         quest_graph: QuestGraphService | None = None,
         guide_progress_by_guide: dict[str, tuple[int, int, str]] | None = None,
         guide_progress_character_key: str = "",
-        launch_travel_callback: Callable[[str], None] | None = None,
+        launch_travel_callback: Callable[[str, tuple[str, ...]], None] | None = None,
         related_data_ready_callback: Callable[[AchievementProvider, GuideProvider], None] | None = None,
         initial_tab: str = DEFAULT_TAB,
     ) -> None:
@@ -587,6 +602,7 @@ class EncyclopediaPage(QWidget):
         return self.tabs.tabText(self.tabs.currentIndex())
 
     def __init__(self, *args, **kwargs) -> None:
+        self._runtime_threads: list[Thread] = []
         self._guide_runtime_ready = False
         self._success_runtime_requested = False
         self._full_guide_tab_requested = False
@@ -602,6 +618,9 @@ class EncyclopediaPage(QWidget):
         self._catalog_context_published = False
         self._character_sources_signature: tuple[object, ...] | None = None
         self._initialize_encyclopedia_shell(*args, **kwargs)
+        self.destroyed.connect(
+            lambda _obj=None, threads=self._runtime_threads: _join_runtime_threads(threads)
+        )
         # Loaded providers are not equivalent to a hydrated Guide widget.
         # Keep the gate idle until the actual Guide view is ready.
         self._related_preload_gate = RelatedPreloadGate()
@@ -625,6 +644,12 @@ class EncyclopediaPage(QWidget):
         if self._guide_runtime_ready:
             self._related_preload_gate.mark_ready()
         self._stabilize_header_geometry()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if hasattr(self, "_quest_load_timer"):
+            self._quest_load_timer.stop()
+        _join_runtime_threads(self._runtime_threads)
+        super().closeEvent(event)
 
     @property
     def related_preload_state(self) -> RelatedPreloadState:
@@ -781,7 +806,7 @@ class EncyclopediaPage(QWidget):
                     result = exc
                 results.put(result)
 
-        Thread(target=worker, name="DofusAtlasQuestIndex", daemon=True).start()
+        _start_runtime_thread(self, worker, "DofusAtlasQuestIndex")
         self._quest_load_timer.start()
 
     def _collect_quest_runtime(self) -> None:
@@ -1059,7 +1084,7 @@ class EncyclopediaPage(QWidget):
                     )
 
         try:
-            Thread(target=worker, name="DofusAtlasGuideStage", daemon=True).start()
+            _start_runtime_thread(self, worker, "DofusAtlasGuideStage")
         except Exception as exc:  # pragma: no cover - defensive runtime guard
             LOGGER.exception("Démarrage du worker Guide impossible")
             self._related_preload_started = False
@@ -1192,7 +1217,7 @@ class EncyclopediaPage(QWidget):
                     )
 
         try:
-            Thread(target=worker, name="DofusAtlasAchievementStage", daemon=True).start()
+            _start_runtime_thread(self, worker, "DofusAtlasAchievementStage")
         except Exception as exc:  # pragma: no cover - defensive runtime guard
             self._achievement_load_started = False
             self.status_callback(f"Chargement Succès impossible : {exc}")
@@ -1339,6 +1364,7 @@ class EncyclopediaPage(QWidget):
             defer_runtime=not self._guide_runtime_ready,
         )
         view.achievementRuntimeRequested.connect(self.request_achievement_warmup)
+        view.catalogRequested.connect(self._restore_guides_catalog_home)
         self.guides_view = view
         self.replace_tab_widget(GUIDES_TAB, view)
 
@@ -1355,6 +1381,29 @@ class EncyclopediaPage(QWidget):
             if callable(apply_runtime):
                 apply_runtime()
         return view
+
+    def _restore_guides_catalog_home(self) -> None:
+        """Show the single approved catalogue even after opening a rich guide.
+
+        The rich detail widget is disposable: rebuilding it only on another
+        explicit guide selection keeps the home path memory-bounded.
+        """
+        previous = self.guides_view
+        if previous is None or isinstance(previous, _resolve_guide_catalog_view_type()):
+            return
+        search_text = str(getattr(previous, "search_text", "") or "")
+        self.guides_view = None
+        catalog = self.ensure_guides_view()
+        if self._guide_runtime_ready and not getattr(catalog, "_runtime_ready", False):
+            catalog.hydrate_runtime(
+                graph=self._quest_graph,
+                initial_progress_by_guide=self._guide_progress_by_guide,
+                initial_progress_character_key=self._guide_progress_character_key,
+            )
+        if search_text:
+            catalog.set_search_text(search_text)
+        self.sync_search_visibility()
+        self.status_callback("Guides : bibliothèque des parcours")
 
     def open_pending_lazy_tab(self) -> None:
         label = str(self._pending_lazy_tab or "")
