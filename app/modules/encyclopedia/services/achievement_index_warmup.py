@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+from uuid import uuid4
+from time import sleep
 
 from app.constants import ROOT_DIR
+from app.core.cache_write_lock import exclusive_cache_write_lock
 
 
 _CACHE_ROOT = ROOT_DIR / ".cache" / "dofus_atlas" / "achievement_sources_v1"
@@ -23,6 +27,9 @@ def achievement_name_index() -> dict[int, str]:
 
     names: dict[int, str] = {}
     try:
+        before = _ACHIEVEMENT_COMPACT_CACHE.stat()
+        signature = (before.st_size, before.st_mtime_ns,
+                     before.st_ctime_ns, before.st_ino)
         with _ACHIEVEMENT_COMPACT_CACHE.open("r", encoding="utf-8") as stream:
             for raw_line in stream:
                 line = raw_line.strip()
@@ -33,28 +40,78 @@ def achievement_name_index() -> dict[int, str]:
                     continue
                 value = row.get("value")
                 if not isinstance(value, dict):
-                    continue
-                try:
-                    achievement_id = int(value.get("id"))
-                except (TypeError, ValueError):
-                    continue
+                    return {}
+                raw_id = value.get("id")
+                # Do not silently turn an incomplete/corrupt Success index
+                # into a usable name mapping (bool also passes isinstance int).
+                if type(raw_id) is not int or raw_id in names:
+                    return {}
+                achievement_id = raw_id
                 names[achievement_id] = str(
                     value.get("name") or f"Succès {achievement_id}"
                 )
+        after = _ACHIEVEMENT_COMPACT_CACHE.stat()
+        if (after.st_size, after.st_mtime_ns,
+                after.st_ctime_ns, after.st_ino) != signature:
+            # A concurrently published JSONL is not an authoritative source
+            # for an atomic names index; the old destination stays intact.
+            return {}
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return {}
     return names
 
 
+def _replace_name_index_with_windows_retry(
+    temporary, destination, *, windows: bool | None = None
+) -> None:
+    """Retry only a genuine Windows sharing violation, not arbitrary errors.
+
+    The cache is rebuildable and each writer uses a unique .tmp file. Windows
+    may briefly deny replacement while another Atlas worker opens the name
+    index. Never return success without a completed atomic replace.
+    """
+    is_windows = os.name == "nt" if windows is None else windows
+    for attempt in range(10):
+        try:
+            temporary.replace(destination)
+            return
+        except PermissionError as exc:
+            if not is_windows or getattr(exc, "winerror", None) != 32 or attempt == 9:
+                raise
+            sleep(0.025 * (attempt + 1))
+
+
 def write_achievement_name_index() -> int:
-    names = achievement_name_index()
-    _ACHIEVEMENT_NAMES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary = _ACHIEVEMENT_NAMES_FILE.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(names, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    temporary.replace(_ACHIEVEMENT_NAMES_FILE)
+    # Unique temp names prevent source collisions, but Windows also requires
+    # serializing replacement of the *same destination* across Atlas workers.
+    # Do not classify WinError 5 as transient: a real ACL denial must still fail.
+    with exclusive_cache_write_lock(_ACHIEVEMENT_NAMES_FILE):
+        names = achievement_name_index()
+        if not names:
+            raise RuntimeError("Success name cache source empty or corrupt")
+        # The same Atlas installations may prewarm the same immutable data
+        # on every start. Keep an identical signed-by-content name cache
+        # without another atomic rewrite and Windows sharing retry.
+        try:
+            previous = json.loads(_ACHIEVEMENT_NAMES_FILE.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError, TypeError):
+            previous = None
+        if (isinstance(previous, dict) and len(previous) == len(names)
+                and all(previous.get(str(item_id)) == name
+                        for item_id, name in names.items())):
+            return len(names)
+        temporary = _ACHIEVEMENT_NAMES_FILE.with_name(
+            f".{_ACHIEVEMENT_NAMES_FILE.name}.{os.getpid()}.{uuid4().hex}.tmp"
+        )
+        try:
+            # Avoid another complete encoded string on top of the in-memory
+            # names table; the previous index remains until atomic replace.
+            with temporary.open("w", encoding="utf-8", newline="") as stream:
+                json.dump(names, stream, ensure_ascii=False, separators=(",", ":"))
+            _replace_name_index_with_windows_retry(temporary, _ACHIEVEMENT_NAMES_FILE)
+        finally:
+            # Also clean up on a partial write, not only replace failures.
+            temporary.unlink(missing_ok=True)
     return len(names)
 
 

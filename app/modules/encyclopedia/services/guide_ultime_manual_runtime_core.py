@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import zlib
 import weakref
 from pathlib import Path
+from uuid import uuid4
 from threading import RLock
 from typing import Any
 
@@ -211,17 +213,24 @@ def write_manual_runtime_compact_cache(
     }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=_manual_runtime_json_default,
-        ),
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    # All Atlas instances can rebuild this shared source cache concurrently.
+    # Never reuse a fixed .tmp path: keep publish atomic and writers isolated.
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    try:
+        # Encode directly to the temporary file: json.dumps + write_text
+        # used to retain a second complete copy of 267 manual cards in RAM.
+        with temporary.open("w", encoding="utf-8", newline="") as stream:
+            json.dump(
+                payload, stream,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=_manual_runtime_json_default,
+            )
+        temporary.replace(path)
+    finally:
+        # Keep the last complete generation after a failed write, and avoid
+        # accumulating large abandoned Guide sidecars across Windows restarts.
+        temporary.unlink(missing_ok=True)
     return len(cards)
 
 
@@ -1309,9 +1318,26 @@ class GuideUltimeManualRuntimeService(GuideUltimeManualConditionsMixin, GuideUlt
             self._append_structured_targets(result, monsters, "monstre", quest_names)
 
         successes = self._string_list(stage.get("successes"))
-        for success in successes:
-            if not self._line_contains(result, success):
-                self._append_line(result, "action", "", f"Profite du passage pour faire le succès « {success} » s'il est encore ouvert.", quest_names)
+        if successes:
+            # One normalized view of authored lines for this stage. Re-running
+            # normalize_text on *every* line for each Success dominated the
+            # final Guide-complet checkpoint on the Windows Doctor trace.
+            normalized_lines = [normalize_text(row.get("text")) for row in result]
+            for success in successes:
+                needle = normalize_text(success)
+                if not needle or not any(needle in text for text in normalized_lines):
+                    previous_count = len(result)
+                    self._append_line(
+                        result, "action", "",
+                        f"Profite du passage pour faire le succès « {success} » s'il est encore ouvert.",
+                        quest_names,
+                    )
+                    # A source instruction can be filtered by the canonical
+                    # authoring rules; cache only rows actually appended.
+                    normalized_lines.extend(
+                        normalize_text(row.get("text"))
+                        for row in result[previous_count:]
+                    )
 
         # Narrative authoring fields are not decorative: they carry capture,
         # deferral, temporal and branch policies that must remain visible at the
